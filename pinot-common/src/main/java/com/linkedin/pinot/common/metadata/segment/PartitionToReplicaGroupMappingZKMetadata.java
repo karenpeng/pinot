@@ -18,9 +18,11 @@ package com.linkedin.pinot.common.metadata.segment;
 import com.linkedin.pinot.common.metadata.ZKMetadata;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import org.apache.helix.ZNRecord;
 
 /**
@@ -29,10 +31,11 @@ import org.apache.helix.ZNRecord;
  *
  */
 public class PartitionToReplicaGroupMappingZKMetadata implements ZKMetadata {
+  private static final String SEPARATOR = "_";
 
   private Map<String, List<String>> _partitionToReplicaGroupMapping;
   private String _tableName;
-  
+
   public PartitionToReplicaGroupMappingZKMetadata(ZNRecord znRecord) {
     _partitionToReplicaGroupMapping = znRecord.getListFields();
     _tableName = znRecord.getId();
@@ -48,6 +51,34 @@ public class PartitionToReplicaGroupMappingZKMetadata implements ZKMetadata {
 
   public void setTableName(String tableName) {
     _tableName = tableName;
+  }
+
+  /**
+   * Compute total number of partitions in the mapping.
+   *
+   * @return the number of partitions
+   */
+  public int getNumPartitions() {
+    Set<String> partitions = new HashSet<>();
+    for (String key : _partitionToReplicaGroupMapping.keySet()) {
+      String partition = key.split(SEPARATOR)[0];
+      partitions.add(partition);
+    }
+    return partitions.size();
+  }
+
+  /**
+   * Compute total number of replica groups in the mapping.
+   *
+   * @return the number of replica groups
+   */
+  public int getNumReplicaGroups() {
+    Set<String> partitions = new HashSet<>();
+    for (String key : _partitionToReplicaGroupMapping.keySet()) {
+      String partition = key.split(SEPARATOR)[1];
+      partitions.add(partition);
+    }
+    return partitions.size();
   }
 
   /**
@@ -70,7 +101,7 @@ public class PartitionToReplicaGroupMappingZKMetadata implements ZKMetadata {
    *
    * @param partition Partition number
    * @param replicaGroup Replica group number
-   * @return List of instances belongs to the given partition and replica group.
+   * @return List of instances belongs to the given partition and replica group
    */
   public List<String> getInstancesfromReplicaGroup(int partition, int replicaGroup) {
     String key = createMappingKey(partition, replicaGroup);
@@ -81,9 +112,35 @@ public class PartitionToReplicaGroupMappingZKMetadata implements ZKMetadata {
   }
 
   /**
+   * Set instances of a replica group for a partition.
+   *
+   * @param partition Partition number
+   * @param replicaGroup Replica group number
+   * @param instances Instances that belongs to the gibn partition and replica group
+   */
+  public void setInstancesToReplicaGroup(int partition, int replicaGroup, List<String> instances) {
+    String key = createMappingKey(partition, replicaGroup);
+    _partitionToReplicaGroupMapping.put(key, instances);
+  }
+
+
+  /**
+   * Get all instances.
+   *
+   * @return Set of all instances for this table
+   */
+  public List<String> getAllInstances() {
+    Set<String> serverList = new HashSet<>();
+    for(List<String> servers: _partitionToReplicaGroupMapping.values()) {
+      serverList.addAll(servers);
+    }
+    return new ArrayList<>(serverList);
+  }
+
+  /**
    * Convert the partition mapping table to ZNRecord.
    *
-   * @return ZNRecord of the partition to replica group mapping table.
+   * @return ZNRecord of the partition to replica group mapping table
    */
   @Override
   public ZNRecord toZNRecord() {
@@ -100,7 +157,7 @@ public class PartitionToReplicaGroupMappingZKMetadata implements ZKMetadata {
    * @return Key for the partition mapping table
    */
   private String createMappingKey(int partition, int replicaGroup) {
-    return partition + "_" + replicaGroup;
+    return partition + SEPARATOR + replicaGroup;
   }
 
   @Override

@@ -86,31 +86,42 @@ public class ControllerRequestBuilderUtil {
 
     for (int i = 0; i < numInstances; ++i) {
       final String instanceId = "Server_localhost_" + i;
-
-      final HelixManager helixZkManager =
-          HelixManagerFactory.getZKHelixManager(helixClusterName, instanceId, InstanceType.PARTICIPANT, zkServer);
-      final StateMachineEngine stateMachineEngine = helixZkManager.getStateMachineEngine();
-      final StateModelFactory<?> stateModelFactory = new EmptySegmentOnlineOfflineStateModelFactory();
-      stateMachineEngine
-          .registerStateModelFactory(EmptySegmentOnlineOfflineStateModelFactory.getStateModelDef(), stateModelFactory);
-      helixZkManager.connect();
-      if (isSingleTenant) {
-        helixZkManager.getClusterManagmentTool()
-            .addInstanceTag(helixClusterName, instanceId,
-                TableNameBuilder.OFFLINE.tableNameWithType(ControllerTenantNameBuilder.DEFAULT_TENANT_NAME));
-        helixZkManager.getClusterManagmentTool()
-            .addInstanceTag(helixClusterName, instanceId,
-                TableNameBuilder.REALTIME.tableNameWithType(ControllerTenantNameBuilder.DEFAULT_TENANT_NAME));
-      } else {
-        helixZkManager.getClusterManagmentTool().addInstanceTag(helixClusterName, instanceId, UNTAGGED_SERVER_INSTANCE);
-      }
-      HelixConfigScope scope =
-          new HelixConfigScopeBuilder(HelixConfigScope.ConfigScopeProperty.PARTICIPANT, helixClusterName)
-              .forParticipant(instanceId).build();
-      Map<String, String> props = new HashMap<>();
-      props.put(CommonConstants.Helix.Instance.ADMIN_PORT_KEY, String.valueOf(adminPort + i));
-      helixZkManager.getClusterManagmentTool().setConfig(scope, props);
+      addFakeDataInstanceToAutoJoinHelixCluster(helixClusterName, zkServer, instanceId, isSingleTenant, adminPort + i);
     }
+  }
+
+  public static void addFakeDataInstanceToAutoJoinHelixCluster(String helixClusterName, String zkServer, String instanceId) throws Exception{
+    addFakeDataInstanceToAutoJoinHelixCluster(helixClusterName, zkServer, instanceId, false, 8097);
+  }
+
+  public static void addFakeDataInstanceToAutoJoinHelixCluster(String helixClusterName, String zkServer, String instanceId, boolean isSingleTenant) throws Exception{
+    addFakeDataInstanceToAutoJoinHelixCluster(helixClusterName, zkServer, instanceId, isSingleTenant, 8097);
+  }
+
+  public static void addFakeDataInstanceToAutoJoinHelixCluster(String helixClusterName, String zkServer, String instanceId, boolean isSingleTenant, int adminPort) throws Exception {
+    final HelixManager helixZkManager =
+        HelixManagerFactory.getZKHelixManager(helixClusterName, instanceId, InstanceType.PARTICIPANT, zkServer);
+    final StateMachineEngine stateMachineEngine = helixZkManager.getStateMachineEngine();
+    final StateModelFactory<?> stateModelFactory = new EmptySegmentOnlineOfflineStateModelFactory();
+    stateMachineEngine
+        .registerStateModelFactory(EmptySegmentOnlineOfflineStateModelFactory.getStateModelDef(), stateModelFactory);
+    helixZkManager.connect();
+    if (isSingleTenant) {
+      helixZkManager.getClusterManagmentTool()
+          .addInstanceTag(helixClusterName, instanceId,
+              TableNameBuilder.OFFLINE.tableNameWithType(ControllerTenantNameBuilder.DEFAULT_TENANT_NAME));
+      helixZkManager.getClusterManagmentTool()
+          .addInstanceTag(helixClusterName, instanceId,
+              TableNameBuilder.REALTIME.tableNameWithType(ControllerTenantNameBuilder.DEFAULT_TENANT_NAME));
+    } else {
+      helixZkManager.getClusterManagmentTool().addInstanceTag(helixClusterName, instanceId, UNTAGGED_SERVER_INSTANCE);
+    }
+    HelixConfigScope scope =
+        new HelixConfigScopeBuilder(HelixConfigScope.ConfigScopeProperty.PARTICIPANT, helixClusterName)
+            .forParticipant(instanceId).build();
+    Map<String, String> props = new HashMap<>();
+    props.put(CommonConstants.Helix.Instance.ADMIN_PORT_KEY, String.valueOf(adminPort));
+    helixZkManager.getClusterManagmentTool().setConfig(scope, props);
   }
 
   public static JSONObject buildBrokerTenantCreateRequestJSON(String tenantName, int numberOfInstances)

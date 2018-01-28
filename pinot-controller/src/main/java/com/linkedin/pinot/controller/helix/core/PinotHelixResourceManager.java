@@ -56,6 +56,9 @@ import com.linkedin.pinot.controller.ControllerConf;
 import com.linkedin.pinot.controller.api.pojos.Instance;
 import com.linkedin.pinot.controller.helix.core.PinotResourceManagerResponse.ResponseStatus;
 import com.linkedin.pinot.controller.helix.core.realtime.PinotLLCRealtimeSegmentManager;
+import com.linkedin.pinot.controller.helix.core.rebalancer.ReplicaGroupMappingRebalancer;
+import com.linkedin.pinot.controller.helix.core.rebalancer.ReplicaGroupSegmentRebalancer;
+import com.linkedin.pinot.controller.helix.core.rebalancer.ReplicaGroupRebalanceType;
 import com.linkedin.pinot.controller.helix.core.sharding.SegmentAssignmentStrategy;
 import com.linkedin.pinot.controller.helix.core.sharding.SegmentAssignmentStrategyEnum;
 import com.linkedin.pinot.controller.helix.core.sharding.SegmentAssignmentStrategyFactory;
@@ -97,6 +100,7 @@ import org.apache.helix.model.InstanceConfig;
 import org.apache.helix.model.LiveInstance;
 import org.apache.helix.store.zk.ZkHelixPropertyStore;
 import org.apache.zookeeper.data.Stat;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -2124,26 +2128,13 @@ public class PinotHelixResourceManager {
     final String tenantName = tableConfig.getTenantConfig().getServer();
     final String tableNameWithType = TableNameBuilder.forType(tableType).tableNameWithType(rawTableName);
 
-    IdealState newIdealState;
-    if (dryRun) {
-      IdealState idealState = _helixAdmin.getResourceIdealState(_helixClusterName, tableNameWithType);
-      newIdealState = getRebalancedIdealState(idealState, targetNumReplicas, tableNameWithType, tenantName);
-    } else {
-      newIdealState = rebalanceResource(targetNumReplicas, tableNameWithType, tenantName);
+    IdealState idealState = _helixAdmin.getResourceIdealState(_helixClusterName, tableNameWithType);
+    IdealState newIdealState = getRebalancedIdealState(idealState, targetNumReplicas, tableNameWithType, tenantName);
+    if (!dryRun) {
+      updateIdealStateWithNewSegmentMapping(tableNameWithType, targetNumReplicas,
+          newIdealState.getRecord().getMapFields());
     }
     return newIdealState.getRecord();
-  }
-
-  private IdealState rebalanceResource(final int targetNumReplicas, final String tableNameWithType, final String tenantName) {
-    HelixHelper.updateIdealState(_helixZkManager, tableNameWithType, new Function<IdealState, IdealState>() {
-      @Nullable
-      @Override
-      public IdealState apply(@Nullable IdealState idealState) {
-        return getRebalancedIdealState(idealState, targetNumReplicas, tableNameWithType, tenantName);
-      }
-    }, RetryPolicies.exponentialBackoffRetryPolicy(5, 1000, 2.0f));
-
-    return  _helixAdmin.getResourceIdealState(_helixClusterName, tableNameWithType);
   }
 
   private IdealState getRebalancedIdealState(IdealState idealState, final int targetNumReplicas, final String tableNameWithType, final String tenantName) {
@@ -2232,6 +2223,132 @@ public class PinotHelixResourceManager {
       // Nothing to do, let the user know via an exception (ideally a status, but...)
       throw new RuntimeException("No LLC partitions in ONLINE state in this table");
     }
+  }
+
+  /**
+   * Rebalance the table with replica groups.
+   *
+   * @param tableName Table name
+   * @param tableType Table type
+   * @param targetNumInstancesPerPartition Target number of instances per replica group
+   * @param targetNumReplicaGroup Target number of replica group
+   * @param dryRun Run with or without the actual update in ZK
+   * @param forceRun Whether to run the rebalance when it would cause the downtime
+   * @return Json object with updated table config, replica group mapping, and segment assignment
+   */
+  public JSONObject rebalanceReplicaGroupTable(String tableName, CommonConstants.Helix.TableType tableType,
+      int targetNumInstancesPerPartition, int targetNumReplicaGroup, boolean dryRun, boolean forceRun)
+      throws Exception {
+    // Fetch the old server and new server list
+    PartitionToReplicaGroupMappingZKMetadata oldReplicaGroupMapping =
+        ZKMetadataProvider.getPartitionToReplicaGroupMappingZKMedata(_propertyStore, tableName);
+    List<String> serverList = getServerInstancesForTable(tableName, tableType);
+    List<String> oldServerList = oldReplicaGroupMapping.getAllInstances();
+
+    // Compute added and removed servers
+    List<String> removedServers = new ArrayList<>();
+    List<String> addedServers = new ArrayList<>();
+    for (String server : oldServerList) {
+      if (!serverList.contains(server)) {
+        removedServers.add(server);
+      }
+    }
+    for (String server : serverList) {
+      if (!oldServerList.contains(server)) {
+        addedServers.add(server);
+      }
+    }
+
+    // Fetch the original replica group strategy config
+    TableConfig tableConfig = getTableConfig(tableName, tableType);
+    ReplicaGroupStrategyConfig replicaGroupConfig = tableConfig.getValidationConfig().getReplicaGroupStrategyConfig();
+
+    // If no replica group config is available, we cannot perform the rebalance algorithm
+    if (replicaGroupConfig == null) {
+      throw new UnsupportedOperationException("This table is not using replica group segment assignment");
+    }
+
+    // TODO: Add the support for partition level replica group
+    String partitionColumn = replicaGroupConfig.getPartitionColumn();
+    if (partitionColumn != null) {
+      throw new UnsupportedOperationException("This table is not using table level replica group");
+    }
+
+    // Perform the basic validation
+    if (targetNumReplicaGroup <= 0 || targetNumInstancesPerPartition <= 0
+        || targetNumReplicaGroup * targetNumInstancesPerPartition > serverList.size()) {
+      throw new UnsupportedOperationException(
+          "Unsupported input config (numReplicaGroup: " + targetNumReplicaGroup + ", " + "numInstancesPerPartition: "
+              + targetNumInstancesPerPartition + ", numServers: " + serverList.size() + ")");
+    }
+
+    // Initialize the replica group mapping rebalancer and compute the new replica group mapping
+    ReplicaGroupMappingRebalancer replicaGroupMappingRebalancer =
+        new ReplicaGroupMappingRebalancer(targetNumInstancesPerPartition, targetNumReplicaGroup, tableConfig,
+            oldReplicaGroupMapping, addedServers, removedServers);
+    PartitionToReplicaGroupMappingZKMetadata newReplicaGroupMapping =
+        replicaGroupMappingRebalancer.computeNewReplicaGroupMapping();
+
+    // Compute and validate the rebalance type
+    ReplicaGroupRebalanceType rebalanceType = replicaGroupMappingRebalancer.getRebalanceType();
+    if (rebalanceType == ReplicaGroupRebalanceType.UNSUPPORTED) {
+      throw new UnsupportedOperationException("Unsupported rebalance type");
+    }
+
+    // Initialize replica group rebalancer
+    String tableNameWithType = TableNameBuilder.forType(tableType).tableNameWithType(tableName);
+    ReplicaGroupSegmentRebalancer replicaGroupSegmentRebalancer =
+        new ReplicaGroupSegmentRebalancer(tableNameWithType, null, null, newReplicaGroupMapping, tableConfig,
+            addedServers, removedServers, rebalanceType, forceRun);
+
+    // Update table config
+    replicaGroupConfig.setNumInstancesPerPartition(targetNumInstancesPerPartition);
+    tableConfig.getValidationConfig().setReplication(Integer.toString(targetNumReplicaGroup));
+
+    // Compute new segment assignment using rebalancer
+    IdealState idealState = _helixAdmin.getResourceIdealState(_helixClusterName, tableNameWithType);
+    Map<String, Map<String, String>> oldMapping = idealState.getRecord().getMapFields();
+    ZNRecord newMapping = replicaGroupSegmentRebalancer.computePartitionAssignment(null, null, oldMapping, null);
+
+    // If dry run, do not update ideal state
+    if (!dryRun) {
+      // Write table config
+      ZKMetadataProvider.setOfflineTableConfig(_propertyStore, tableNameWithType, TableConfig.toZnRecord(tableConfig));
+      // Write new Replica group mapping
+      ZKMetadataProvider.setInstancePartitionAssignmentFromPropertyStore(_propertyStore, newReplicaGroupMapping);
+      // Update IdealState
+      updateIdealStateWithNewSegmentMapping(tableNameWithType, targetNumReplicaGroup, newMapping.getMapFields());
+    }
+
+    // Update response
+    JSONObject result = new JSONObject();
+    result.put("tableConfig", TableConfig.toJSONConfig(tableConfig));
+    result.put("replicaGroupMapping", newReplicaGroupMapping.toZNRecord().getListFields());
+    result.put("idealState", newMapping);
+
+    return result;
+  }
+
+  /**
+   * Helper method to update idealstate with the new segment assignment
+   *
+   * @param tableNameWithType Table name with type
+   * @param numReplica The number of replica
+   * @param segmentAssignmentMapping Segment assignment mapping
+   */
+  private void updateIdealStateWithNewSegmentMapping(final String tableNameWithType, final int numReplica,
+      final Map<String, Map<String, String>> segmentAssignmentMapping) {
+    HelixHelper.updateIdealState(_helixZkManager, tableNameWithType, new Function<IdealState, IdealState>() {
+      @Nullable
+      @Override
+      public IdealState apply(@Nullable IdealState idealState) {
+        for (Map.Entry<String, Map<String, String>> entry : segmentAssignmentMapping.entrySet()) {
+          idealState.setInstanceStateMap(entry.getKey(), entry.getValue());
+        }
+        idealState.setReplicas(Integer.toString(numReplica));
+        return idealState;
+      }
+    }, RetryPolicies.exponentialBackoffRetryPolicy(5, 1000, 2.0f));
   }
 
   /**
